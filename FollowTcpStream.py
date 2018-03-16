@@ -9,6 +9,7 @@
 # Dependencies:
 # - TcpFlow 1.4
 
+# Example: FollowTcpStream.py -i 10.0.2.15:1067 -p 80 -o "C:\Users\chrisu\AppData\Local\Temp\malware\FollowTcpStream.out" "data\test.pcap"
 # Example: FollowTcpStream.py -i 10.0.2.15:1067 -p 80 -o "C:\Users\chrisu\AppData\Local\Temp\malware\FollowTcpStream.out" "C:\Users\chrisu\Documents\cert.at\Vorträge\LKOOE\Logs\Scripts.pcap"
 
 import argparse
@@ -28,6 +29,9 @@ else:
     isWindows = False
     isLinux = True
 
+gl_TestRunOutput = []
+gl_TestRun = False
+
 gl_OutFile = ""
 gl_Verbose = False
 gl_ChronologicalOrder = False
@@ -42,14 +46,23 @@ class OutputWriter:
     FooterPending = False
 
     def normal(self, text):
+        global gl_TestRunOutput
+
         if (self.FirstWrite):
             self.FirstWrite = False
+            gl_TestRunOutput = []
             if (not gl_NoSeparators):
                 self.normal('\x01[FTS]> HEADER <[FTS]\x02\n\n')
-        if gl_OutFile == "":
+        if gl_TestRun:
+            gl_TestRunOutput.append(text)
+            gl_TestRunOutput.append("\n")
+        elif gl_OutFile == "":
             print(text)
         else:
-            open(gl_OutFile, 'at').write(text + "\n")
+            if (isinstance(text, bytes)):
+                open(gl_OutFile, 'ab').write(text)
+            else:
+                open(gl_OutFile, 'at').write(text + "\n")
 
     def verbose(self, text):
         if (gl_Verbose):
@@ -84,7 +97,7 @@ class Flow:
 
 
 # parse out tcp flow for IP
-def parseFlow(pcapFile, ipAddress, tcpPort):
+def parseFlow(pcapFile, ipAddress = b"", tcpPort = b""):
     out = OutputWriter()
 
     if (isWindows):
@@ -118,17 +131,10 @@ def parseFlow(pcapFile, ipAddress, tcpPort):
 
             # Unhexdumpify data
             hexdumprows = re.findall(b'^[0-9a-f]+: ((?:[0-9a-f]{4} |[0-9a-f]{2} )+).*?$', hexdump, re.MULTILINE)
-            # hexdumprows = iter(hexdumprows)
             data = b""
             for hexdumprow in hexdumprows:
                 data = b''.join([data, hexdumprow])
             data = data.replace(b" ", b"")
-            # data_bytes = []
-            # for i in range(0, len(data), 2):
-            #     data_bytes.append(chr(int(data[i:i + 2], 16)))
-            # data = b''.join([a.encode() if sys.version_info[0] > 2 else a for a in data_bytes])
-            # flow.Data = data
-
             flow.Data = binascii.unhexlify(data)
 
             flowId = flow.Id
@@ -197,21 +203,41 @@ def parseFlow(pcapFile, ipAddress, tcpPort):
 
                 # Un-chunking ...
                 if (flow.isChunked):
+                    # if (flow.Id == b"069.004.231.030:00080-192.168.001.010:49190"):
+                    #     print("Hallo")
+                    #     out.verbose(b"[" + flow.Data + b"]")
+                    #     out.verbose("")
                     chunkCounter = 0
                     chunkedData = flow.Data
                     flow.Data = b""
                     while (len(chunkedData)):
                         chunkCounter += 1
-                        chunkSizeHex, chunkedData = re.search(b'^([0-9a-fA-F]+)[^\r\n]*\r\n(.*)$', chunkedData, re.DOTALL).groups()
-                        chunkSizeHex = chunkSizeHex.decode()
-                        chunkSize = int(chunkSizeHex, 16)
-                        if (chunkSize):
-                            out.verbose("        " + "Merging chunk #" + str(chunkCounter) + ": " + str(chunkSize) + " (" + chunkSizeHex + ") Bytes")
-                            flow.Data = b''.join([flow.Data, chunkedData[:chunkSize]])
-                            chunkedData = chunkedData[chunkSize:]
-                            chunkedData = chunkedData[2:]
+                        res = re.search(b'^([0-9a-fA-F]+)[^\r\n]*\r\n(.*)$', chunkedData, re.DOTALL)
+                        if (res):
+                            chunkSizeHex, chunkedData = res.groups()
+                            chunkSizeHex = chunkSizeHex.decode()
+                            chunkSize = int(chunkSizeHex, 16)
+                            if (chunkSize):
+                                out.verbose("        " + "Merging chunk #" + str(chunkCounter) + ": " + str(chunkSize) + " (" + chunkSizeHex + ") Bytes")
+                                flow.Data = b''.join([flow.Data, chunkedData[:chunkSize]])
+                                chunkedData = chunkedData[chunkSize:]
+                                chunkedData = chunkedData[2:]
+                            else:
+                                chunkedData = ""
                         else:
-                            chunkedData = ""
+                            out.verbose("        " + "Warning: Parsing error! (Note: Usually due to some special situation in the PCAP leading to interpretation mistakes in Tcpflow.)")
+                            out.verbose("---- Content already merged ----")
+                            out.verbose(b"[")
+                            out.verbose(flow.Data)
+                            out.verbose(b"]")
+                            out.verbose("\n--------------------------------")
+                            out.verbose("-------- Content pending -------")
+                            out.verbose(b"[")
+                            out.verbose(chunkedData)
+                            out.verbose(b"]")
+                            out.verbose("\n--------------------------------")
+                            flow.Data = b''.join([flow.Data, chunkedData])
+                            break
 
                 # Un-gzipping ...
                 if (flow.isGzipped):
@@ -222,8 +248,7 @@ def parseFlow(pcapFile, ipAddress, tcpPort):
                         sizeDecompressed = len(flow.Data)
                         out.verbose("        " + "Decompressing: " + str(sizeCompressed) + " bytes -> " + str(sizeDecompressed) + " bytes")
                     except Exception as exc:
-                        out.normal('DECOMPRESSION ERROR: %s' % exc)
-                        out.normal('\n\n')
+                        out.verbose("        " + 'DECOMPRESSION ERROR: %s' % exc)
 
                 # Replacing non-printables ...
                 if (gl_Verbose):
@@ -274,7 +299,7 @@ def parseFlow(pcapFile, ipAddress, tcpPort):
                         elif (flow.isHttp and flow.isHttpRequest and not flow.HttpResponseFlow):
                             if (not gl_NoSeparators):
                                 if (not gl_NoMetaInformation):
-                                    out.normal("\x01[FTS]> HTTP_REQUEST: " + flow.SrcIpAddress.decode() + ":" + flow.SrcPort.decode() + " - " + flow.DstIpAddress.decode() + ":" + flow.DstPort + " <[FTS]\x02\n")
+                                    out.normal("\x01[FTS]> HTTP_REQUEST: " + flow.SrcIpAddress.decode() + ":" + flow.SrcPort.decode() + " - " + flow.DstIpAddress.decode() + ":" + flow.DstPort.decode() + " <[FTS]\x02\n")
                                 else:
                                     out.normal("\x01[FTS]> HTTP_REQUEST <[FTS]\x02\n")
                             out.normal(flow.HttpHeader.decode())
